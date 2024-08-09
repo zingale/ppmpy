@@ -38,7 +38,9 @@ class Euler:
     def __init__(self, nx, C, *,
                  fixed_dt=None,
                  bc_left_type="outflow", bc_right_type="outflow",
-                 gamma=1.4, init_cond=None,
+                 gamma=1.4,
+                 init_cond=None, grav_func=None,
+                 params=None,
                  use_limiting=True, use_flattening=True):
 
         self.grid = FVGrid(nx, ng=4)
@@ -47,6 +49,16 @@ class Euler:
         self.C = C
         self.gamma = gamma
         self.fixed_dt = fixed_dt
+
+        self.grav_func = grav_func
+
+        # params can be passed into the initial condition and gravity
+        # functions to provude any parameters needed to implement the
+        # custom behavior
+        if params is None:
+            self.params = {}
+        else:
+            self.params = params
 
         # setup the BCs -- we need the flexibiility to have different
         # types for each state variable.  In particular, we want
@@ -140,6 +152,22 @@ class Euler:
             for ivar in range(self.v.nvar):
                 Im[:, iwave, ivar], Ip[:, iwave, ivar] = q_parabola[ivar].integrate(sigma)
 
+        # now deal with gravity
+        if self.grav_func is not None:
+            g = self.grav_func(self.grid, q[:, self.v.qrho], self.params)
+            self.grid.ghost_fill(g,
+                                 bc_left_type=self.bcs_left[self.v.umx],
+                                 bc_right_type=self.bcs_right[self.v.umx])
+
+            g_parabola = PPMInterpolant(self.grid, g, limit=self.use_limiting, chi_flat=chi)
+
+            Ip_g = self.grid.scratch_array(nc=3)
+            Im_g = self.grid.scratch_array(nc=3)
+
+            for iwave, sgn in enumerate([-1, 0, 1]):
+                sigma = (q[:, self.v.qu] + sgn * cs) * self.dt / self.grid.dx
+                Im_g[:, iwave], Ip_g[:, iwave] = g_parabola.integrate(sigma)
+
         # loop over zones -- we will construct the state on
         # the left and right sides of this zone, these are
         # q_{i,r} and q_{i+1,l}
@@ -168,7 +196,10 @@ class Euler:
             # loop over waves and compute l . (qref - I) for each wave
             beta_xm = np.zeros(3)
             for iwave in range(3):
-                beta_xm[iwave] = lvec[iwave, :] @ (q_ref_m - Im[i, iwave, :])
+                dq = q_ref_m - Im[i, iwave, :]
+                if self.grav_func is not None:
+                    dq[self.v.qu] -= 0.5 * self.dt * Im_g[i, iwave]
+                beta_xm[iwave] = lvec[iwave, :] @ dq
 
             # finally sum up the waves moving toward the interface,
             # accumulating (l . (q_ref - I)) r
@@ -188,7 +219,10 @@ class Euler:
             # loop over waves and compute l . (qref - I) for each wave
             beta_xp = np.zeros(3)
             for iwave in range(3):
-                beta_xp[iwave] = lvec[iwave, :] @ (q_ref_p - Ip[i, iwave, :])
+                dq = q_ref_p - Ip[i, iwave, :]
+                if self.grav_func is not None:
+                    dq[self.v.qu] -= 0.5 * self.dt * Ip_g[i, iwave]
+                beta_xp[iwave] = lvec[iwave, :] @ dq
 
             # finally sum up the waves moving toward the interface,
             # accumulating (l . (q_ref - I)) r
@@ -243,8 +277,21 @@ class Euler:
         # conservative update
         # this is a loop over zones
 
+        U_old = self.U.copy()
+
         for i in range(self.grid.lo, self.grid.hi+1):
             self.U[i, :] += self.dt * (flux[i, :] - flux[i+1, :]) / self.grid.dx
+
+        # time-centered gravitational source terms
+        if self.grav_func:
+            g_old = self.grav_func(self.grid, U_old[:, self.v.urho], self.params)
+            g_new = self.grav_func(self.grid, self.U[:, self.v.urho], self.params)
+
+            self.U[:, self.v.umx] += 0.5 * (U_old[:, self.v.urho] * g_old +
+                                            self.U[:, self.v.urho] * g_new)
+
+            self.U[:, self.v.uener] += 0.5 * (U_old[:, self.v.umx] * g_old +
+                                              self.U[:, self.v.umx] * g_new)
 
     def evolve(self, tmax, *, verbose=True):
         """The main evolution driver to advance the state to time tmax"""
